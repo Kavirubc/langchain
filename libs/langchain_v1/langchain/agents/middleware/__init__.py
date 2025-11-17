@@ -1,5 +1,6 @@
 """Entrypoint to using [middleware](https://docs.langchain.com/oss/python/langchain/middleware) plugins with [Agents](https://docs.langchain.com/oss/python/langchain/agents)."""  # noqa: E501
 
+from .compensation import CompensationMiddleware
 from .context_editing import (
     ClearToolUsesEdit,
     ContextEditingMiddleware,
@@ -45,6 +46,7 @@ __all__ = [
     "AgentState",
     "ClearToolUsesEdit",
     "CodexSandboxExecutionPolicy",
+    "CompensationMiddleware",
     "ContextEditingMiddleware",
     "DockerExecutionPolicy",
     "FilesystemFileSearchMiddleware",

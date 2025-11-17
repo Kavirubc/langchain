@@ -1,16 +1,8 @@
-"""Agent factory for creating agents with middleware support.
-
-This module has been extended to optionally support compensating actions
-for tools with side effects, mirroring the compensation behavior available
-in the legacy `create_react_agent` implementation.
-"""
+"""Agent factory for creating agents with middleware support."""
 
 from __future__ import annotations
 
 import itertools
-import json
-import time
-import uuid
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
@@ -648,9 +640,6 @@ def create_agent(  # noqa: PLR0915
     debug: bool = False,
     name: str | None = None,
     cache: BaseCache | None = None,
-    enable_compensation: bool = False,
-    compensation_mapping: Dict[str, str] | None = None,
-    state_mappers: Dict[str, Callable[[Any, Dict[str, Any]], Dict[str, Any]]] | None = None,
 ) -> CompiledStateGraph[
     AgentState[ResponseT], ContextT, _InputAgentState, _OutputAgentState[ResponseT]
 ]:
@@ -943,10 +932,6 @@ def create_agent(  # noqa: PLR0915
     base_state = state_schema if state_schema is not None else AgentState
     state_schemas.add(base_state)
 
-    # Extend state schema with compensation fields when enabled
-    if enable_compensation:
-        state_schemas.add(_CompensationStateExt)
-
     resolved_state_schema = _resolve_schema(state_schemas, "StateSchema", None)
     input_schema = _resolve_schema(state_schemas, "InputSchema", "input")
     output_schema = _resolve_schema(state_schemas, "OutputSchema", "output")
@@ -1206,25 +1191,12 @@ def create_agent(  # noqa: PLR0915
 
     def model_node(state: AgentState, runtime: Runtime[ContextT]) -> dict[str, Any]:
         """Sync model request handler with sequential middleware processing."""
-        # Inject recovery hint to the model if in recovery mode
-        messages_for_model = state["messages"]
-        if enable_compensation and state.get("recovery_mode", False):
-            messages_for_model = [
-                *messages_for_model,
-                SystemMessage(
-                    content=(
-                        "Previous action failed. Compensation has been performed. "
-                        "Consider alternative approaches or report the failure."
-                    )
-                ),
-            ]
-
         request = ModelRequest(
             model=model,
             tools=default_tools,
             system_prompt=system_prompt,
             response_format=initial_response_format,
-            messages=messages_for_model,
+            messages=state["messages"],
             tool_choice=None,
             state=state,
             runtime=runtime,
@@ -1272,25 +1244,12 @@ def create_agent(  # noqa: PLR0915
 
     async def amodel_node(state: AgentState, runtime: Runtime[ContextT]) -> dict[str, Any]:
         """Async model request handler with sequential middleware processing."""
-        # Inject recovery hint to the model if in recovery mode
-        messages_for_model = state["messages"]
-        if enable_compensation and state.get("recovery_mode", False):
-            messages_for_model = [
-                *messages_for_model,
-                SystemMessage(
-                    content=(
-                        "Previous action failed. Compensation has been performed. "
-                        "Consider alternative approaches or report the failure."
-                    )
-                ),
-            ]
-
         request = ModelRequest(
             model=model,
             tools=default_tools,
             system_prompt=system_prompt,
             response_format=initial_response_format,
-            messages=messages_for_model,
+            messages=state["messages"],
             tool_choice=None,
             state=state,
             runtime=runtime,
@@ -1316,18 +1275,6 @@ def create_agent(  # noqa: PLR0915
     # Only add tools node if we have tools
     if tool_node is not None:
         graph.add_node("tools", tool_node)
-
-    # Build compensation config if enabled
-    compensation_stack = CompensationStack() if enable_compensation else None
-    compensation_metadata: dict[str, ToolMetadata] = {}
-    if enable_compensation and compensation_mapping:
-        for tool_name, comp_tool_name in compensation_mapping.items():
-            compensation_metadata[tool_name] = {
-                "name": tool_name,
-                "description": f"Tool {tool_name} with compensation",
-                "has_side_effects": True,
-                "compensation_tool": comp_tool_name,
-            }
 
     # Add middleware nodes
     for m in middleware:
@@ -1444,230 +1391,52 @@ def create_agent(  # noqa: PLR0915
     graph.add_edge(START, entry_node)
     # add conditional edges only if tools exist
     if tool_node is not None:
-        if enable_compensation:
-            # Insert error detection and compensation routing between tools and model
-            def _error_detection_node(state: dict[str, Any]) -> dict[str, Any]:
-                # Use existing utility to find last AI and following tool messages
-                last_ai, tool_messages = _fetch_last_ai_and_tool_messages(state["messages"])  # type: ignore[arg-type]
+        # Default routing (no compensation nodes)
+        # Only include exit_node in destinations if any tool has return_direct=True
+        # or if there are structured output tools
+        tools_to_model_destinations = [loop_entry_node]
+        if (
+            any(tool.return_direct for tool in tool_node.tools_by_name.values())
+            or structured_output_tools
+        ):
+            tools_to_model_destinations.append(exit_node)
 
-                # Default to provided stack or create one
-                stack: CompensationStack = state.get("compensation_stack") or compensation_stack  # type: ignore[assignment]
-                failure_detected = False
-
-                # Track each tool result for compensation if successful
-                for tm in tool_messages:
-                    # determine if error-like content
-                    content_str = str(tm.content)
-                    if "Error:" in content_str or "error" in content_str.lower():
-                        failure_detected = True
-                        break
-
-                    # Successful tool call - record if configured
-                    tool_name = getattr(tm, "name", None) or ""
-                    if tool_name and tool_name in compensation_metadata and compensation_metadata[tool_name].get(
-                        "has_side_effects", False
-                    ):
-                        # Find args by matching tool_call id
-                        args: Dict[str, Any] = {}
-                        for call in getattr(last_ai, "tool_calls", []) or []:
-                            if call.get("id") == getattr(tm, "tool_call_id", None):
-                                args = call.get("args", {})
-                                break
-
-                        record: CompensationRecord = {
-                            "id": str(uuid.uuid4()),
-                            "tool_name": tool_name,
-                            "params": args,
-                            "result": _extract_tool_result_from_message(tm),
-                            "timestamp": time.time(),
-                            "compensated": False,
-                            "compensation_tool": compensation_metadata[tool_name].get("compensation_tool"),
-                        }
-                        stack.push(record)
-
-                updates: dict[str, Any] = {"failure_detected": failure_detected}
-                if stack is not None:
-                    updates["compensation_stack"] = stack
-                return updates
-
-            def _error_routing(state: dict[str, Any]) -> str:
-                # If failure, go to compensation
-                if state.get("failure_detected", False):
-                    return "compensation"
-
-                # Otherwise, replicate tools->model routing logic
-                last_ai_message, tool_messages = _fetch_last_ai_and_tool_messages(state["messages"])  # type: ignore[arg-type]
-
-                # 1. Exit if all executed client-side tools had return_direct
-                client_side_tool_calls = [
-                    c for c in last_ai_message.tool_calls if c["name"] in tool_node.tools_by_name
-                ]
-                if client_side_tool_calls and all(
-                    tool_node.tools_by_name[c["name"]].return_direct for c in client_side_tool_calls
-                ):
-                    return exit_node
-
-                # 2. Exit if a structured output tool was executed
-                if any(t.name in structured_output_tools for t in tool_messages):
-                    return exit_node
-
-                # 3. Default to continue the loop
-                return loop_entry_node
-
-            def _compensation_node(state: dict[str, Any]) -> dict[str, Any]:
-                stack: CompensationStack = state.get("compensation_stack") or compensation_stack  # type: ignore[assignment]
-                messages: list[AnyMessage] = []
-                # Iterate uncompensated in LIFO order
-                for record in stack.get_uncompensated():
-                    comp_tool_name = record.get("compensation_tool")
-                    if not comp_tool_name:
-                        continue
-                    comp_tool = tool_node.tools_by_name.get(comp_tool_name)
-                    if comp_tool is None:
-                        continue
-
-                    # Map parameters
-                    comp_params: Dict[str, Any] = {}
-                    if state_mappers and record.get("tool_name") in state_mappers:
-                        mapper = state_mappers[record["tool_name"]]  # type: ignore[index]
-                        try:
-                            comp_params = mapper(record.get("result"), record.get("params", {}))
-                        except Exception:  # noqa: BLE001
-                            comp_params = {}
-                    else:
-                        res = record.get("result")
-                        if isinstance(res, dict):
-                            for key in [
-                                "id",
-                                "booking_id",
-                                "resource_id",
-                                "transaction_id",
-                                "reservation_id",
-                            ]:
-                                if key in res:
-                                    comp_params = {key: res[key]}
-                                    break
-                            if not comp_params and getattr(comp_tool, "args_schema", None):
-                                try:
-                                    param_names = list(comp_tool.args_schema.model_fields.keys())  # type: ignore[attr-defined]
-                                    for pn in param_names:
-                                        if pn in res:
-                                            comp_params[pn] = res[pn]
-                                except Exception:  # noqa: BLE001
-                                    pass
-
-                    try:
-                        if comp_params:
-                            result = comp_tool.invoke(comp_params)
-                            stack.mark_compensated(record["id"])  # type: ignore[index]
-                            messages.append(
-                                AIMessage(
-                                    content=f"Compensated {record.get('tool_name')} with {comp_tool_name}: {result}"
-                                )
-                            )
-                        else:
-                            messages.append(
-                                AIMessage(
-                                    content=(
-                                        f"Failed to compensate {record.get('tool_name')}: "
-                                        "No parameters could be extracted"
-                                    )
-                                )
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        messages.append(
-                            AIMessage(
-                                content=f"Failed to compensate {record.get('tool_name')}: {exc}"
-                            )
-                        )
-
-                return {
-                    "messages": messages,
-                    "compensation_stack": stack,
-                    "recovery_mode": True,
-                    "compensation_in_progress": False,
-                    "failure_detected": False,
-                }
-
-            # Register nodes
-            graph.add_node("error_detection", RunnableCallable(_error_detection_node, trace=False))
-            graph.add_node("compensation", RunnableCallable(_compensation_node, trace=False))
-
-            # Route: tools -> error_detection -> (compensation | loop or end)
-            graph.add_edge("tools", "error_detection")
-
-            graph.add_conditional_edges(
-                "error_detection",
-                RunnableCallable(_error_routing, trace=False),
-                [loop_entry_node, "compensation", exit_node],
-            )
-
-            # After compensation, return to loop entry
-            graph.add_edge("compensation", loop_entry_node)
-            # Also add model -> tools routing as usual
-            model_to_tools_destinations = ["tools", exit_node]
-            if response_format or loop_exit_node != "model":
-                model_to_tools_destinations.append(loop_entry_node)
-
-            graph.add_conditional_edges(
-                loop_exit_node,
-                RunnableCallable(
-                    _make_model_to_tools_edge(
-                        model_destination=loop_entry_node,
-                        structured_output_tools=structured_output_tools,
-                        end_destination=exit_node,
-                    ),
-                    trace=False,
+        graph.add_conditional_edges(
+            "tools",
+            RunnableCallable(
+                _make_tools_to_model_edge(
+                    tool_node=tool_node,
+                    model_destination=loop_entry_node,
+                    structured_output_tools=structured_output_tools,
+                    end_destination=exit_node,
                 ),
-                model_to_tools_destinations,
-            )
-        else:
-            # Default routing (no compensation)
-            # Only include exit_node in destinations if any tool has return_direct=True
-            # or if there are structured output tools
-            tools_to_model_destinations = [loop_entry_node]
-            if (
-                any(tool.return_direct for tool in tool_node.tools_by_name.values())
-                or structured_output_tools
-            ):
-                tools_to_model_destinations.append(exit_node)
+                trace=False,
+            ),
+            tools_to_model_destinations,
+        )
 
-            graph.add_conditional_edges(
-                "tools",
-                RunnableCallable(
-                    _make_tools_to_model_edge(
-                        tool_node=tool_node,
-                        model_destination=loop_entry_node,
-                        structured_output_tools=structured_output_tools,
-                        end_destination=exit_node,
-                    ),
-                    trace=False,
+        # base destinations are tools and exit_node
+        # we add the loop_entry node to edge destinations if:
+        # - there is an after model hook(s) -- allows jump_to to model
+        #   potentially artificially injected tool messages, ex HITL
+        # - there is a response format -- to allow for jumping to model to handle
+        #   regenerating structured output tool calls
+        model_to_tools_destinations = ["tools", exit_node]
+        if response_format or loop_exit_node != "model":
+            model_to_tools_destinations.append(loop_entry_node)
+
+        graph.add_conditional_edges(
+            loop_exit_node,
+            RunnableCallable(
+                _make_model_to_tools_edge(
+                    model_destination=loop_entry_node,
+                    structured_output_tools=structured_output_tools,
+                    end_destination=exit_node,
                 ),
-                tools_to_model_destinations,
-            )
-
-            # base destinations are tools and exit_node
-            # we add the loop_entry node to edge destinations if:
-            # - there is an after model hook(s) -- allows jump_to to model
-            #   potentially artificially injected tool messages, ex HITL
-            # - there is a response format -- to allow for jumping to model to handle
-            #   regenerating structured output tool calls
-            model_to_tools_destinations = ["tools", exit_node]
-            if response_format or loop_exit_node != "model":
-                model_to_tools_destinations.append(loop_entry_node)
-
-            graph.add_conditional_edges(
-                loop_exit_node,
-                RunnableCallable(
-                    _make_model_to_tools_edge(
-                        model_destination=loop_entry_node,
-                        structured_output_tools=structured_output_tools,
-                        end_destination=exit_node,
-                    ),
-                    trace=False,
-                ),
-                model_to_tools_destinations,
-            )
+                trace=False,
+            ),
+            model_to_tools_destinations,
+        )
     elif len(structured_output_tools) > 0:
         graph.add_conditional_edges(
             loop_exit_node,
