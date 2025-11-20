@@ -192,11 +192,41 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
         self.compensation_mapping = compensation_mapping
         self.state_mappers = state_mappers or {}
         self._name = name
+        self._tools_by_name: Dict[str, Any] = {}  # Cache for tool instances
 
     @property
     def name(self) -> str:
         """Return the middleware name."""
         return self._name
+
+    def _get_tool(self, tool_name: str, request: ToolCallRequest) -> Any | None:
+        """Get a tool instance by name from the runtime.
+
+        Args:
+            tool_name: Name of the tool to retrieve.
+            request: The tool call request containing runtime context.
+
+        Returns:
+            The tool instance if found, None otherwise.
+        """
+        # Check cache first
+        if tool_name in self._tools_by_name:
+            return self._tools_by_name[tool_name]
+
+        # Try to get tools from the runtime's graph
+        runtime = request.runtime
+        if hasattr(runtime, "graph"):
+            graph = runtime.graph
+            # Look for the tools node in the graph
+            if hasattr(graph, "nodes") and "tools" in graph.nodes:
+                tools_node = graph.nodes["tools"]
+                if hasattr(tools_node, "tools_by_name"):
+                    tools_by_name = tools_node.tools_by_name
+                    # Cache all tools for future use
+                    self._tools_by_name.update(tools_by_name)
+                    return tools_by_name.get(tool_name)
+
+        return None
 
     def _extract_tool_result(self, msg: ToolMessage) -> Any:
         """Extract the actual result from a ToolMessage content."""
@@ -213,24 +243,60 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
         return content
 
     def _is_error_result(self, result: ToolMessage) -> bool:
-        """Check if a tool result indicates an error."""
+        """Check if a tool result indicates an error.
+
+        Args:
+            result: The ToolMessage to check.
+
+        Returns:
+            True if the result indicates an error, False otherwise.
+        """
         # Check status attribute
         if hasattr(result, "status") and result.status == "error":
             return True
 
-        # Check content for error indicators
-        content_str = str(result.content)
-        error_indicators = ["Error:", "error", "failed", "exception"]
+        # Check content for error indicators (case-insensitive)
+        # Handle both string content and dict content with 'message' field
+        content = result.content
+        if isinstance(content, dict):
+            # Check if dict has 'status' field indicating error
+            if content.get("status") == "error":
+                return True
+            # Check if dict has 'message' field with error text
+            if "message" in content:
+                content = content["message"]
+            # Check for error in dict keys or values
+            elif any("error" in str(k).lower() or "error" in str(v).lower()
+                     for k, v in content.items()):
+                return True
+
+        content_str = str(content).lower()
+        error_indicators = [
+            "error:",
+            "error",
+            "failed",
+            "exception",
+            "traceback",
+            "not available",
+            "unavailable",
+            "cannot",
+            "unable to",
+            "does not exist",
+        ]
         return any(indicator in content_str for indicator in error_indicators)
 
     def _map_compensation_params(
-        self, record: CompensationRecord, comp_tool_name: str
+        self,
+        record: CompensationRecord,
+        comp_tool_name: str,
+        request: "ToolCallRequest | None" = None,
     ) -> Dict[str, Any]:
         """Map parameters from the original action to the compensation tool.
 
         Args:
             record: The compensation record containing original params and result.
             comp_tool_name: Name of the compensation tool.
+            request: Optional tool call request to access runtime tools.
 
         Returns:
             Dictionary of parameters for the compensation tool.
@@ -247,6 +313,45 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
 
         # Automatic parameter detection
         result = record["result"]
+
+        # Try to match parameters based on compensation tool schema
+        if request and isinstance(result, dict):
+            comp_tool = self._get_tool(comp_tool_name, request)
+            if comp_tool:
+                arg_names = set()
+
+                # Try to get the Pydantic model first
+                schema = getattr(comp_tool, "args_schema", None)
+                if not schema and hasattr(comp_tool, "get_input_schema"):
+                     try:
+                        schema = comp_tool.get_input_schema()
+                     except Exception:  # noqa: BLE001
+                        pass
+
+                if schema and not isinstance(schema, dict):
+                     if hasattr(schema, "model_fields"):  # Pydantic v2
+                        arg_names = set(schema.model_fields.keys())
+                     elif hasattr(schema, "__fields__"):  # Pydantic v1
+                        arg_names = set(schema.__fields__.keys())
+
+                if not arg_names:
+                    # Fallback to args property
+                    args_dict = getattr(comp_tool, "args", None)
+                    if isinstance(args_dict, dict):
+                         arg_names = set(args_dict.keys())
+
+                # If we found argument names, look for them in the result or original params
+                if arg_names:
+                    mapped_params = {}
+                    for arg in arg_names:
+                        if arg in result:
+                            mapped_params[arg] = result[arg]
+                        elif arg in record["params"]:
+                            mapped_params[arg] = record["params"][arg]
+
+                    if mapped_params:
+                        return mapped_params
+
         if isinstance(result, dict):
             # Try common ID field names
             for key in [
@@ -283,42 +388,35 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
         Returns:
             ToolMessage with the compensation result.
         """
-        # Get the tool from the runtime
-        tools_by_name = {}
+        tool_call_id = str(uuid.uuid4())
 
-        # Access tools from the state/runtime
-        # The tools should be available through the request's runtime context
-        runtime = request.runtime
-        if hasattr(runtime, "config") and runtime.config:
-            # Try to get tools from graph nodes
-            pass
-
-        # For now, we'll create a synthetic tool message
-        # In practice, this should invoke the actual tool
         try:
-            # Create a tool call for compensation
-            comp_tool_call = {
-                "name": tool_name,
-                "args": params,
-                "id": str(uuid.uuid4()),
-                "type": "tool_call",
-            }
+            # Get the actual tool instance
+            tool = self._get_tool(tool_name, request)
 
-            # This is a simplified version - in practice, we'd need to:
-            # 1. Look up the tool from available tools
-            # 2. Execute it with the mapped parameters
-            # 3. Return the actual result
+            if tool is None:
+                msg = f"Compensation tool '{tool_name}' not found in available tools"
+                return ToolMessage(
+                    content=f"Error: {msg}",
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                    status="error",
+                )
 
-            # For now, return a placeholder
+            # Invoke the tool with the mapped parameters
+            result = tool.invoke(params)
+
+            # Return successful ToolMessage
             return ToolMessage(
-                content=f"Compensation executed: {tool_name} with params {params}",
-                tool_call_id=comp_tool_call["id"],
+                content=str(result),
+                tool_call_id=tool_call_id,
                 name=tool_name,
             )
+
         except Exception as e:  # noqa: BLE001
             return ToolMessage(
                 content=f"Compensation failed: {e}",
-                tool_call_id=str(uuid.uuid4()),
+                tool_call_id=tool_call_id,
                 name=tool_name,
                 status="error",
             )
@@ -346,7 +444,9 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
         state = request.state
 
         # Get or initialize compensation stack
-        comp_stack: CompensationStack = state.get("compensation_stack", CompensationStack())  # type: ignore[assignment]
+        if "compensation_stack" not in state or state["compensation_stack"] is None:
+            state["compensation_stack"] = CompensationStack()
+        comp_stack: CompensationStack = state["compensation_stack"]  # type: ignore[assignment]
 
         # Execute the tool
         result = handler(request)
@@ -364,6 +464,7 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
         if is_error:
             # Failure detected - trigger compensation in LIFO order
             compensated_actions = []
+            compensation_messages = []
 
             for record in comp_stack.get_uncompensated():
                 comp_tool_name = record.get("compensation_tool")
@@ -371,7 +472,7 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
                     continue
 
                 # Map parameters for compensation
-                comp_params = self._map_compensation_params(record, comp_tool_name)
+                comp_params = self._map_compensation_params(record, comp_tool_name, request)
 
                 if comp_params:
                     # Execute compensation tool
@@ -388,18 +489,18 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
                         "result": comp_result.content,
                     })
 
+                    # Add compensation result to messages
+                    compensation_messages.append(comp_result)
+
             # Update state with compensation info
             state["compensation_stack"] = comp_stack
             state["compensated_actions"] = state.get("compensated_actions", []) + compensated_actions
 
-            # Optionally inject a message about compensation
-            if compensated_actions:
-                compensation_summary = "; ".join(
-                    f"compensated {a['original_tool']} with {a['compensation_tool']}"
-                    for a in compensated_actions
-                )
-                # Note: In the actual implementation, this message would be added to the state
-                # For now, we just track it in the result
+            # Inject compensation messages into the conversation history
+            if compensation_messages:
+                # Add the compensation ToolMessages to the state's message list
+                if "messages" in state:
+                    state["messages"] = list(state["messages"]) + compensation_messages
 
             return result
 
@@ -439,7 +540,9 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
         state = request.state
 
         # Get or initialize compensation stack
-        comp_stack: CompensationStack = state.get("compensation_stack", CompensationStack())  # type: ignore[assignment]
+        if "compensation_stack" not in state or state["compensation_stack"] is None:
+            state["compensation_stack"] = CompensationStack()
+        comp_stack: CompensationStack = state["compensation_stack"]  # type: ignore[assignment]
 
         # Execute the tool
         result = await handler(request)
@@ -457,6 +560,7 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
         if is_error:
             # Failure detected - trigger compensation in LIFO order
             compensated_actions = []
+            compensation_messages = []
 
             for record in comp_stack.get_uncompensated():
                 comp_tool_name = record.get("compensation_tool")
@@ -464,10 +568,10 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
                     continue
 
                 # Map parameters for compensation
-                comp_params = self._map_compensation_params(record, comp_tool_name)
+                comp_params = self._map_compensation_params(record, comp_tool_name, request)
 
                 if comp_params:
-                    # Execute compensation tool (sync for now)
+                    # Execute compensation tool
                     comp_result = self._execute_compensation_tool(
                         comp_tool_name, comp_params, request
                     )
@@ -481,9 +585,18 @@ class CompensationMiddleware(AgentMiddleware[CompensationState, Any]):
                         "result": comp_result.content,
                     })
 
+                    # Add compensation result to messages
+                    compensation_messages.append(comp_result)
+
             # Update state with compensation info
             state["compensation_stack"] = comp_stack
             state["compensated_actions"] = state.get("compensated_actions", []) + compensated_actions
+
+            # Inject compensation messages into the conversation history
+            if compensation_messages:
+                # Add the compensation ToolMessages to the state's message list
+                if "messages" in state:
+                    state["messages"] = list(state["messages"]) + compensation_messages
 
             return result
 
